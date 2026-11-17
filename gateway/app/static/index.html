@@ -22,22 +22,32 @@
   tr.cur td { background: #e8f6ec; }
   tr.draining td { background: #fff6e0; }
   tr.offlinable td { background: #eef2f7; color: #4a5a6a; }
+  tr.blocked td { background: #fdecea; }
   .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
   .badge.cur { background: #1f9d55; color: #fff; }
   .badge.draining { background: #e8a13a; color: #fff; }
   .badge.offlinable { background: #607d8b; color: #fff; }
+  .badge.blocked { background: #b3261e; color: #fff; }
+  .badge.done { background: #1f9d55; color: #fff; }
+  .badge.unknown { background: #b3261e; color: #fff; }
+  .badge.pending { background: #e8a13a; color: #fff; }
+  .badge.conflict { background: #7b1fa2; color: #fff; }
   button { padding: 6px 14px; border: 0; border-radius: 6px; background: #1266a8;
            color: #fff; cursor: pointer; font-size: 14px; }
   button:disabled { background: #9db4c6; cursor: not-allowed; }
   button.warn { background: #c25e1d; }
+  button.gray { background: #5b6b7a; }
   input, select { padding: 5px 8px; border: 1px solid #b9c4cf; border-radius: 6px; font-size: 14px; }
   ul { margin: 8px 0 0; padding-left: 18px; font-size: 13px; max-height: 220px; overflow-y: auto; }
   .msg { margin-top: 8px; font-size: 14px; min-height: 20px; }
   .msg.ok { color: #1f7a3d; }
   .msg.err { color: #b3261e; }
+  .msg.warn { color: #9a5b00; }
   .muted { color: #6b7a89; font-size: 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   #req-log li.done { color: #1f7a3d; }
   #req-log li.fail { color: #b3261e; }
+  code { background: #eef2f7; padding: 0 4px; border-radius: 4px; }
 </style>
 </head>
 <body>
@@ -49,10 +59,33 @@
   <section>
     <h2>发起转发请求</h2>
     <label>响应延迟(ms) <input id="delay" type="number" value="3000" min="0" max="60000" style="width:90px"></label>
+    <label>查看缓存组 <input id="call-group" type="text" value="demo" style="width:90px"></label>
     <button onclick="fire(1)">发送 1 个</button>
     <button onclick="fire(5)">并发 5 个</button>
     <span class="muted">请求在接纳时绑定当时的目标，切换后仍从原上游取回完整响应</span>
     <ul id="req-log"></ul>
+  </section>
+
+  <section>
+    <h2>让上游清除缓存组（带操作号）</h2>
+    <div class="row">
+      <label>操作号 <input id="op-id" type="text" style="width:190px" placeholder="例如 op-20261117-001"></label>
+      <button onclick="newOpId()" class="gray">生成</button>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <label>缓存组 <input id="op-group" type="text" value="cover" style="width:110px"></label>
+      <label>回包延迟(ms) <input id="op-delay" type="number" value="0" min="0" max="60000" style="width:90px"></label>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button onclick="doClear()">清除缓存组</button>
+      <button onclick="doClear(true)" class="gray">同一操作号重试</button>
+      <button onclick="doQuery()" class="gray">查询操作</button>
+      <button onclick="doVerify()" class="gray">核实待定</button>
+    </div>
+    <div class="msg" id="clear-msg"></div>
+    <div class="muted">操作号首次提交时绑定当时的上游；之后同号同组无论并发重试、网关重启或回包丢失，上游只清一次并返回首次结果；同号改组会被拒绝。切换目标后旧操作仍向原目标核对。</div>
+    <h2 style="margin-top:14px">缓存操作记录</h2>
+    <ul id="op-log"></ul>
   </section>
 
   <section>
@@ -71,9 +104,10 @@
   <section>
     <h2>上游与在途数</h2>
     <table>
-      <thead><tr><th>名称</th><th>地址</th><th>角色</th><th>在途</th><th>状态</th></tr></thead>
+      <thead><tr><th>名称</th><th>地址</th><th>角色</th><th>在途</th><th>待定清缓存</th><th>状态</th></tr></thead>
       <tbody id="upstream-body"></tbody>
     </table>
+    <div class="muted" style="margin-top:6px">待定清缓存 &gt; 0 表示该上游有结果未核实的清缓存操作，未核实前不得下线。</div>
   </section>
 
   <section>
@@ -86,6 +120,7 @@
 let state = null;
 let lastProbe = null;   // {target, base_version, probe_id, ok}
 let reqSeq = 0;
+let lastOpId = null;
 const $ = (id) => document.getElementById(id);
 
 async function api(method, path, body) {
@@ -100,7 +135,8 @@ async function api(method, path, body) {
   return { status: r.status, body: j };
 }
 
-function esc(s) { return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function fmtTime(ts) { return ts ? new Date(ts * 1000).toLocaleTimeString() : ''; }
 
 async function refresh() {
   try {
@@ -109,21 +145,35 @@ async function refresh() {
   } catch (e) { /* gateway restarting */ }
 }
 
+const OP_STATUS = {
+  done:      ['done', '已清理'],
+  pending:   ['pending', '处理中'],
+  unknown:   ['unknown', '结果未定'],
+  conflict:  ['conflict', '操作号冲突'],
+  not_cleared: ['draining', '确认未清理'],
+};
+
 function render() {
   const r = state.route;
   let html = `当前目标 <b>${esc(r.current_target)}</b> · 路由版号 <b>v${r.version}</b> · ` +
-             `更新于 ${new Date(r.updated_at * 1000).toLocaleTimeString()}`;
+             `更新于 ${fmtTime(r.updated_at)}`;
   if (state.boot && state.boot.cleared_inflight)
     html += ` · 本次启动已清理中断在途 ${state.boot.cleared_inflight} 条`;
+  if (state.boot && state.boot.unresolved_cache_operations)
+    html += ` · 待核实清缓存操作 ${state.boot.unresolved_cache_operations} 个`;
   $('route-summary').innerHTML = html;
 
   $('upstream-body').innerHTML = state.upstreams.map(u => {
     let cls, badge;
     if (u.is_current)      { cls = 'cur';        badge = '<span class="badge cur">当前目标</span>'; }
+    else if (u.offline_blocked_reason === 'cache_result_unknown') {
+      cls = 'blocked'; badge = '<span class="badge blocked">不得下线 · 清缓存结果未定</span>';
+    }
     else if (u.inflight>0) { cls = 'draining';   badge = `<span class="badge draining">旧目标 · 排空中</span>`; }
     else                   { cls = 'offlinable'; badge = '<span class="badge offlinable">旧目标 · 在途已清零，可下线 ✓</span>'; }
     return `<tr class="${cls}"><td>${esc(u.name)}</td><td>${esc(u.url)}</td>` +
-           `<td>${u.is_current ? '当前' : '旧'}</td><td>${u.inflight}</td><td>${badge}</td></tr>`;
+           `<td>${u.is_current ? '当前' : '旧'}</td><td>${u.inflight}</td>` +
+           `<td>${u.unresolved_cache_operations || 0}</td><td>${badge}</td></tr>`;
   }).join('');
 
   const sel = $('candidate');
@@ -133,11 +183,21 @@ function render() {
   if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
 
   $('inflight-list').innerHTML = state.inflight.map(x =>
-    `<li>#${x.id.slice(0,8)} → <b>${esc(x.target)}</b> ${esc(x.path)} · 已进行 ${x.age_ms}ms</li>`
+    `<li>#${esc(x.id.slice(0,8))} → <b>${esc(x.target)}</b> ${esc(x.path)} · ` +
+    `${x.kind === 'cache_clear' ? '清缓存' : '转发'} · 已进行 ${x.age_ms}ms</li>`
   ).join('') || '<li class="muted">（无在途请求）</li>';
 
+  $('op-log').innerHTML = (state.cache_operations || []).map(op => {
+    const [cls, text] = OP_STATUS[op.status] || ['pending', op.status];
+    let extra = `→ ${esc(op.target)} · 组 <b>${esc(op.group)}</b> · 版号 v${op.route_version}`;
+    if (op.clear_count != null) extra += ` · 清理次数 <b>${op.clear_count}</b>`;
+    if (op.last_error) extra += ` · <span class="muted">${esc(op.last_error)}</span>`;
+    return `<li><span class="badge ${cls}">${text}</span> <code>${esc(op.operation_id)}</code> ${extra}<br>` +
+           `<span class="muted">${fmtTime(op.updated_at)}${op.verified_at ? ' · 已于 ' + fmtTime(op.verified_at) + ' 核实' : ''}</span></li>`;
+  }).join('') || '<li class="muted">（暂无清缓存操作）</li>';
+
   $('probe-log').innerHTML = state.recent_probes.map(p =>
-    `<li>${new Date(p.created_at*1000).toLocaleTimeString()} 探测 <b>${esc(p.target)}</b> ` +
+    `<li>${fmtTime(p.created_at)} 探测 <b>${esc(p.target)}</b> ` +
     `@页面版号 v${p.base_version} → ${p.ok ? '成功' : '失败 ' + esc(p.detail.error || JSON.stringify(p.detail))}</li>`
   ).join('') || '<li class="muted">（暂无）</li>';
 
@@ -183,7 +243,7 @@ async function doCommit() {
   });
   if (status === 200 && body.ok) {
     msg.className = 'msg ok';
-    msg.textContent = `已切换到 ${body.current_target}（新版号 v${body.version}），新请求立即走新目标`;
+    msg.textContent = `已切换到 ${body.current_target}（新版号 v${body.version}），新请求立即走新目标；旧目标上的清缓存操作仍向原目标核对`;
   } else if (status === 409) {
     msg.className = 'msg err';
     msg.textContent = `版号冲突：路由已被他人切换（当前 ${body.current_target} @v${body.current_version}），已刷新，请重新探测`;
@@ -205,14 +265,16 @@ function logReq(text, cls) {
 }
 
 async function fireOne(delay) {
-  const id = logReq(`→ 发起请求（延迟 ${delay}ms）…`);
+  const group = $('call-group').value.trim() || 'demo';
+  const id = logReq(`→ 发起请求（延迟 ${delay}ms，查看组 ${group}）…`);
   const t0 = performance.now();
-  const { status, body } = await api('POST', '/api/call', { delay_ms: delay });
+  const { status, body } = await api('POST', '/api/call', { delay_ms: delay, group });
   const dt = Math.round(performance.now() - t0);
   const li = document.getElementById(id);
   if (body && body.ok) {
     li.className = 'done';
-    li.textContent = `✓ #${body.request_id.slice(0,8)} 由 ${body.target} 完整返回 · 耗时 ${dt}ms · 上游延迟 ${body.upstream.delay_ms}ms`;
+    const cnt = body.upstream.clear_count ?? body.upstream.clear_counts?.[group] ?? 0;
+    li.textContent = `✓ #${body.request_id.slice(0,8)} 由 ${body.target} 完整返回 · 耗时 ${dt}ms · 上游延迟 ${body.upstream.delay_ms}ms · 组 ${group} 清理次数 ${cnt}`;
   } else {
     li.className = 'fail';
     li.textContent = `✗ ${status} ${body && (body.error || '') || ''}`;
@@ -225,6 +287,76 @@ function fire(n) {
   for (let i = 0; i < n; i++) fireOne(d);
 }
 
+function newOpId() {
+  const d = new Date();
+  const p = (x) => String(x).padStart(2, '0');
+  $('op-id').value = `op-${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}-` +
+                     `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}-` +
+                     Math.random().toString(36).slice(2, 6);
+}
+
+function clearMsg(cls, text) {
+  const m = $('clear-msg');
+  m.className = 'msg ' + cls;
+  m.textContent = text;
+}
+
+function showClearResult(status, body) {
+  if (!body) { clearMsg('err', `请求失败（HTTP ${status}）`); return; }
+  if (body.outcome === 'done') {
+    clearMsg('ok', body.message || `已清理，清理次数 ${body.operation.clear_count}`);
+  } else if (body.outcome === 'replayed') {
+    clearMsg('ok', `重放首次结果（未再次清理）：${body.target} 上组 ${body.operation.group} 清理次数 ${body.operation.clear_count}`);
+  } else if (body.outcome === 'unknown') {
+    clearMsg('warn', body.message || '结果未定，暂勿下线原目标');
+  } else if (body.outcome === 'in_progress') {
+    clearMsg('warn', body.message || '原尝试处理中，请稍后用同一操作号重试');
+  } else if (body.outcome === 'not_cleared') {
+    clearMsg('warn', body.message || '原目标确认未清理，可用同一操作号重试');
+  } else if (body.outcome === 'conflict' || status === 409) {
+    clearMsg('err', body.message || `操作号已绑定缓存组 ${body.operation?.group}，不可改组`);
+  } else {
+    clearMsg('err', body.error || `HTTP ${status}`);
+  }
+  if (body.operation) lastOpId = body.operation.operation_id;
+}
+
+async function doClear(retrySame) {
+  let opId = $('op-id').value.trim();
+  if (retrySame && lastOpId) opId = lastOpId;
+  if (!opId) { newOpId(); opId = $('op-id').value; }
+  $('op-id').value = opId;
+  const group = $('op-group').value.trim() || 'cover';
+  const delay = Math.max(0, parseInt($('op-delay').value || '0', 10));
+  clearMsg('', `提交清除 ${group}（操作号 ${opId}，回包延迟 ${delay}ms）…`);
+  const { status, body } = await api('POST', '/api/cache/clear',
+                                     { operation_id: opId, group, delay_ms: delay });
+  lastOpId = opId;
+  showClearResult(status, body);
+  refresh();
+}
+
+async function doQuery() {
+  const opId = $('op-id').value.trim();
+  if (!opId) return;
+  const { status, body } = await api('GET', '/api/cache/operations/' + encodeURIComponent(opId));
+  if (status === 404) { clearMsg('err', `未找到操作号 ${opId}`); return; }
+  if (!body.ok) { clearMsg('warn', body.message || '结果未定'); }
+  else clearMsg('ok', `操作 ${opId}：${body.operation.status}，目标 ${body.operation.target}` +
+                      (body.operation.clear_count != null ? `，清理次数 ${body.operation.clear_count}` : ''));
+  refresh();
+}
+
+async function doVerify() {
+  const opId = $('op-id').value.trim();
+  if (!opId) return;
+  clearMsg('', `向原目标核对操作号 ${opId}…`);
+  const { status, body } = await api('POST', '/api/cache/verify/' + encodeURIComponent(opId));
+  showClearResult(status, body);
+  refresh();
+}
+
+newOpId();
 refresh();
 setInterval(refresh, 1000);
 </script>

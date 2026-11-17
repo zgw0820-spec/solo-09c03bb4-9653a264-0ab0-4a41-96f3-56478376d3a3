@@ -1,11 +1,16 @@
 name: edge-gateway-demo
 
 services:
+  # Demo upstreams. Each keeps its cache-clear ledger in SQLite so an
+  # operation id is only ever cleared once, even across upstream restarts.
   upstream-a:
     build: ./upstream
     environment:
       UPSTREAM_NAME: alpha
       DEFAULT_DELAY_MS: "3000"   # 默认响应延迟，可被请求参数 delay_ms 覆盖
+      UPSTREAM_DB: /state/upstream.db
+    volumes:
+      - upstream-a-state:/state
     ports:
       - "9001:8000"
 
@@ -14,9 +19,13 @@ services:
     environment:
       UPSTREAM_NAME: beta
       DEFAULT_DELAY_MS: "500"
+      UPSTREAM_DB: /state/upstream.db
+    volumes:
+      - upstream-b-state:/state
     ports:
       - "9002:8000"
 
+  # Gateway also serves the on-duty web console at /
   gateway:
     build: ./gateway
     environment:
@@ -34,3 +43,5 @@ services:
 
 volumes:
   gateway-data:
+  upstream-a-state:
+  upstream-b-state:
